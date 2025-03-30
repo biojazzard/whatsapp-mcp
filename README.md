@@ -1,5 +1,12 @@
 # WhatsApp MCP Server
 
+(Forked to my needs, all credits to the author: lharries)
+
++ Using now modernc.org/sqlite
++ Database changes as I was getting ISO format errors.
+
+---
+
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
 With this you can search you personal Whatsapp messages, search your contacts and send messages.
