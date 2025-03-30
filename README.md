@@ -5,6 +5,34 @@
 + Using now modernc.org/sqlite
 + Database changes as I was getting ISO format errors.
 
+I am using windows, and my MCP server looks like;
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "C:/Users/<USER>/.local/bin/uv.exe",
+      "args": [
+        "--directory",
+        "C:/Users/<USER>/Documents/Cline/MCP/whatsapp-mcp/whatsapp-mcp-server",
+        "run",
+        "main.py"
+      ],
+      "autoApprove": [
+        "get_chat",
+        "get_direct_chat_by_contact",
+        "get_last_interaction"
+        "list_messages",
+        "list_chats",
+        "send_message",
+        "search_contacts",
+      ],
+      "disabled": false
+    }
+  },
+}
+```
+
 ---
 
 This is a Model Context Protocol (MCP) server for WhatsApp.
