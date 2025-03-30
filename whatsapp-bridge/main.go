@@ -12,15 +12,15 @@ import (
 	"time"
 
 	"github.com/mdp/qrterminal"
-	_ "github.com/mattn/go-sqlite3"
-	
+	_ "modernc.org/sqlite"
+
 	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
-	waProto "go.mau.fi/whatsmeow/binary/proto"
 )
 
 // Message represents a chat message for our client
@@ -31,30 +31,39 @@ type Message struct {
 	IsFromMe bool
 }
 
-// Database handler for storing message history
+// MessageStore handles database operations for storing message history
 type MessageStore struct {
 	db *sql.DB
 }
 
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
-	// Create directory for database if it doesn't exist
 	if err := os.MkdirAll("store", 0755); err != nil {
-		return nil, fmt.Errorf("failed to create store directory: %v", err)
+		return nil, fmt.Errorf("failed to create store directory: %w", err)
 	}
-	
-	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+
+	db, err := sql.Open("sqlite",
+		"file:store/messages.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
-		return nil, fmt.Errorf("failed to open message database: %v", err)
+		return nil, fmt.Errorf("failed to open message database: %w", err)
 	}
-	
-	// Create tables if they don't exist
+
+	var fkEnabled bool
+	err = db.QueryRow("PRAGMA foreign_keys").Scan(&fkEnabled)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to check foreign keys status: %w", err)
+	}
+	if !fkEnabled {
+		db.Close()
+		return nil, fmt.Errorf("failed to enable foreign keys")
+	}
+
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TEXT
 		);
 		
 		CREATE TABLE IF NOT EXISTS messages (
@@ -62,7 +71,7 @@ func NewMessageStore() (*MessageStore, error) {
 			chat_jid TEXT,
 			sender TEXT,
 			content TEXT,
-			timestamp TIMESTAMP,
+			timestamp TEXT,
 			is_from_me BOOLEAN,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
@@ -70,9 +79,9 @@ func NewMessageStore() (*MessageStore, error) {
 	`)
 	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("failed to create tables: %v", err)
+		return nil, fmt.Errorf("failed to create tables: %w", err)
 	}
-	
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -81,25 +90,24 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
-// Store a chat in the database
+// StoreChat stores or updates a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
 		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
+		jid, name, lastMessageTime.UTC().Format(time.RFC3339),
 	)
 	return err
 }
 
-// Store a message in the database
+// StoreMessage stores a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool) error {
-	// Only store if there's actual content
 	if content == "" {
 		return nil
 	}
-	
+
 	_, err := store.db.Exec(
 		"INSERT OR REPLACE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?)",
-		id, chatJID, sender, content, timestamp, isFromMe,
+		id, chatJID, sender, content, timestamp.UTC().Format(time.RFC3339), isFromMe,
 	)
 	return err
 }
@@ -114,19 +122,22 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var messages []Message
 	for rows.Next() {
 		var msg Message
-		var timestamp time.Time
+		var timestamp string
 		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe)
 		if err != nil {
 			return nil, err
 		}
-		msg.Time = timestamp
+		msg.Time, err = time.Parse(time.RFC3339, timestamp)
+		if err != nil {
+			return nil, err
+		}
 		messages = append(messages, msg)
 	}
-	
+
 	return messages, nil
 }
 
@@ -137,18 +148,22 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	chats := make(map[string]time.Time)
 	for rows.Next() {
 		var jid string
-		var lastMessageTime time.Time
+		var lastMessageTime string
 		err := rows.Scan(&jid, &lastMessageTime)
 		if err != nil {
 			return nil, err
 		}
-		chats[jid] = lastMessageTime
+		parsedTime, err := time.Parse(time.RFC3339, lastMessageTime)
+		if err != nil {
+			return nil, err
+		}
+		chats[jid] = parsedTime
 	}
-	
+
 	return chats, nil
 }
 
@@ -157,15 +172,13 @@ func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
 		return ""
 	}
-	
-	// Try to get text content
+
 	if text := msg.GetConversation(); text != "" {
 		return text
 	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
 		return extendedText.GetText()
 	}
-	
-	// For now, we're ignoring non-text messages
+
 	return ""
 }
 
@@ -173,6 +186,7 @@ func extractTextContent(msg *waProto.Message) string {
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+	MsgID   string `json:"msgId,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -186,72 +200,61 @@ func sendWhatsAppMessage(client *whatsmeow.Client, phone, message string) (bool,
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
-	
-	// Create JID for recipient
+
 	recipientJID := types.JID{
 		User:   phone,
-		Server: "s.whatsapp.net", // For personal chats
+		Server: "s.whatsapp.net",
 	}
-	
-	// Send the message
+
 	_, err := client.SendMessage(context.Background(), recipientJID, &waProto.Message{
 		Conversation: proto.String(message),
 	})
-	
+
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
-	
+
 	return true, fmt.Sprintf("Message sent to %s", phone)
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, port int) {
-	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
 		fmt.Println("Received request to send message")
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		
-		// Parse the request body
+
 		var req SendMessageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
 			return
 		}
-		
-		// Validate request
+
 		if req.Phone == "" || req.Message == "" {
 			http.Error(w, "Phone and message are required", http.StatusBadRequest)
 			return
 		}
-		
-		// Send the message
+
 		success, message := sendWhatsAppMessage(client, req.Phone, req.Message)
 		fmt.Println("Message sent", success, message)
-		// Set response headers
+
 		w.Header().Set("Content-Type", "application/json")
-		
-		// Set appropriate status code
+
 		if !success {
 			w.WriteHeader(http.StatusInternalServerError)
 		}
-		
-		// Send response
+
 		json.NewEncoder(w).Encode(SendMessageResponse{
 			Success: success,
 			Message: message,
 		})
 	})
-	
-	// Start the server
+
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
-	
-	// Run server in a goroutine so it doesn't block
+
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
@@ -260,30 +263,27 @@ func startRESTServer(client *whatsmeow.Client, port int) {
 }
 
 func main() {
-	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
 
-	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
-	
-	// Create directory for database if it doesn't exist
+
 	if err := os.MkdirAll("store", 0755); err != nil {
-		logger.Errorf("Failed to create store directory: %v", err)
-		return
-	}
-	
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
-	if err != nil {
-		logger.Errorf("Failed to connect to database: %v", err)
+		logger.Errorf("Fatal: Failed to create store directory: %v", err)
 		return
 	}
 
-	// Get device store - This contains session information
+	container, err := sqlstore.New("sqlite",
+		"file:store/whatsapp.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)",
+		dbLog)
+	if err != nil {
+		logger.Errorf("Fatal: Failed to connect to session database: %v", err)
+		os.Exit(1)
+	}
+
 	deviceStore, err := container.GetFirstDevice()
 	if err != nil {
 		if err == sql.ErrNoRows {
-			// No device exists, create one
 			deviceStore = container.NewDevice()
 			logger.Infof("Created new device")
 		} else {
@@ -292,46 +292,38 @@ func main() {
 		}
 	}
 
-	// Create client instance
 	client := whatsmeow.NewClient(deviceStore, logger)
 	if client == nil {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
-	
-	// Initialize message store
+
 	messageStore, err := NewMessageStore()
 	if err != nil {
 		logger.Errorf("Failed to initialize message store: %v", err)
 		return
 	}
 	defer messageStore.Close()
-	
-	// Setup event handling for messages and history sync
+
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
-			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
-			
+
 		case *events.HistorySync:
-			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
-			
+
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
-			
+
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
 		}
 	})
-	
-	// Create channel to track connection success
+
 	connected := make(chan bool, 1)
-	
-	// Connect to WhatsApp
+
 	if client.Store.ID == nil {
-		// No ID stored, this is a new client, need to pair with phone
 		qrChan, _ := client.GetQRChannel(context.Background())
 		err = client.Connect()
 		if err != nil {
@@ -339,7 +331,6 @@ func main() {
 			return
 		}
 
-		// Print QR code for pairing with phone
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
@@ -349,8 +340,7 @@ func main() {
 				break
 			}
 		}
-		
-		// Wait for connection
+
 		select {
 		case <-connected:
 			fmt.Println("\nSuccessfully connected and authenticated!")
@@ -359,7 +349,6 @@ func main() {
 			return
 		}
 	} else {
-		// Already logged in, just connect
 		err = client.Connect()
 		if err != nil {
 			logger.Errorf("Failed to connect: %v", err)
@@ -368,71 +357,60 @@ func main() {
 		connected <- true
 	}
 
-	// Wait a moment for connection to stabilize
 	time.Sleep(2 * time.Second)
-	
+
 	if !client.IsConnected() {
 		logger.Errorf("Failed to establish stable connection")
 		return
 	}
-	
+
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-	
-	// Start REST API server
+
 	startRESTServer(client, 8080)
-	
-	// Create a channel to keep the main goroutine alive
+
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
-	
+
 	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
-	
-	// Wait for termination signal
+
 	<-exitChan
-	
+
 	fmt.Println("Disconnecting...")
-	// Disconnect client
 	client.Disconnect()
 }
 
 // Handle regular incoming messages
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Extract text content
 	content := extractTextContent(msg.Message)
 	if content == "" {
-		return // Skip non-text messages
+		return
 	}
-	
-	// Save message to database
+
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
-	
-	// Get contact name if possible
+
 	name := sender
 	contact, err := client.Store.Contacts.GetContact(msg.Info.Sender)
 	if err == nil && contact.FullName != "" {
 		name = contact.FullName
 	}
-	
-	// Update chat in database
-	err = messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
+
+	err = messageStore.StoreChat(chatJID, name, msg.Info.Timestamp.UTC())
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
 	}
-	
-	// Store message in database
+
 	err = messageStore.StoreMessage(
-		msg.Info.ID, 
-		chatJID, 
-		sender, 
+		msg.Info.ID,
+		chatJID,
+		sender,
 		content,
-		msg.Info.Timestamp,
+		msg.Info.Timestamp.UTC(),
 		msg.Info.IsFromMe,
 	)
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
 	} else {
-		// Log message reception
 		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
 		direction := "←"
 		if msg.Info.IsFromMe {
@@ -445,56 +423,48 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
-	
+
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
-		// Parse JID from the conversation
 		if conversation.ID == nil {
 			continue
 		}
-		
+
 		chatJID := *conversation.ID
-		
-		// Try to parse the JID
+
 		jid, err := types.ParseJID(chatJID)
 		if err != nil {
 			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
 			continue
 		}
-		
-		// Get contact name
+
 		name := jid.User
 		contact, err := client.Store.Contacts.GetContact(jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		}
-		
-		// Process messages
+
 		messages := conversation.Messages
 		if len(messages) > 0 {
-			// Update chat with latest message timestamp
 			latestMsg := messages[0]
 			if latestMsg == nil || latestMsg.Message == nil {
 				continue
 			}
-			
-			// Get timestamp from message info
+
 			timestamp := time.Time{}
 			if ts := latestMsg.Message.GetMessageTimestamp(); ts != 0 {
 				timestamp = time.Unix(int64(ts), 0)
 			} else {
 				continue
 			}
-			
-			messageStore.StoreChat(chatJID, name, timestamp)
-			
-			// Store messages
+
+			messageStore.StoreChat(chatJID, name, timestamp.UTC())
+
 			for _, msg := range messages {
 				if msg == nil || msg.Message == nil {
 					continue
 				}
-				
-				// Extract text content
+
 				var content string
 				if msg.Message.Message != nil {
 					if conv := msg.Message.Message.GetConversation(); conv != "" {
@@ -503,16 +473,13 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						content = ext.GetText()
 					}
 				}
-				
-				// Log the message content for debugging
+
 				logger.Infof("Message content: %v", content)
-				
-				// Skip non-text messages
+
 				if content == "" {
 					continue
 				}
-				
-				// Determine sender
+
 				var sender string
 				isFromMe := false
 				if msg.Message.Key != nil {
@@ -529,40 +496,37 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				} else {
 					sender = jid.User
 				}
-				
-				// Store message
+
 				msgID := ""
 				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
 					msgID = *msg.Message.Key.ID
 				}
-				
-				// Get message timestamp
+
 				timestamp := time.Time{}
 				if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
 					timestamp = time.Unix(int64(ts), 0)
 				} else {
 					continue
 				}
-				
+
 				err = messageStore.StoreMessage(
 					msgID,
 					chatJID,
 					sender,
 					content,
-					timestamp,
+					timestamp.UTC(),
 					isFromMe,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
 					syncedCount++
-					// Log successful message storage
-					logger.Infof("Stored message: [%s] %s -> %s: %s", timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
+					logger.Infof("Stored message: [%s] %s -> %s: %s", timestamp.Format(time.RFC3339), sender, chatJID, content)
 				}
 			}
 		}
 	}
-	
+
 	fmt.Printf("History sync complete. Stored %d text messages.\n", syncedCount)
 }
 
@@ -583,7 +547,6 @@ func requestHistorySync(client *whatsmeow.Client) {
 		return
 	}
 
-	// Build and send a history sync request
 	historyMsg := client.BuildHistorySyncRequest(nil, 100)
 	if historyMsg == nil {
 		fmt.Println("Failed to build history sync request.")
@@ -594,7 +557,7 @@ func requestHistorySync(client *whatsmeow.Client) {
 		Server: "s.whatsapp.net",
 		User:   "status",
 	}, historyMsg)
-	
+
 	if err != nil {
 		fmt.Printf("Failed to request history sync: %v\n", err)
 	} else {
